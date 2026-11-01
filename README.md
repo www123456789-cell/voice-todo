@@ -13,6 +13,25 @@
 - M5（已做）：云端转写适配层（requestUrl + 手工 multipart，手机端走这条），转写/整理失败处挂「重试」按钮
 - M6（未做）：手机端联调（iOS 上录音格式 m4a、转写完删音频、临时目录排除同步）
 
+## 安装（手机 / 其它设备）
+
+仓库：`www123456789-cell/voice-todo`，release tag 与 `manifest.json` 的 version 一致（当前 `0.1.0`）。
+
+- 手机：BRAT → Add beta plugin → 填 `www123456789-cell/voice-todo`
+- 桌面：直接把本目录放进 `.obsidian/plugins/voice-todo/`，或同样用 BRAT
+
+注意：EasySync 不同步插件文件（2026-10-13 实测），手机端只能走 BRAT。
+
+## 发布
+
+```powershell
+.\publish.ps1 -TokenFile C:\path\to\token.txt
+```
+
+- token 需要 classic PAT，勾 `repo`；想连 `.github/workflows/release.yml` 一起推，还要勾 `workflow`（只勾 repo 时该文件会 404，脚本会警告但继续发 release）
+- 脚本做三件事：建/更新仓库文件 → 建 tag（= manifest.version）的 release → 挂 `main.js` / `manifest.json` / `styles.css`
+- 附件名必须一字不差，BRAT 只认这三个名字
+
 ## 开发
 
 ```powershell
