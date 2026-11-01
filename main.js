@@ -431,6 +431,29 @@ function newMarker() {
 function normalizeTaskText(raw) {
   return raw.replace(/\s*←\s*\[\[[^\]]*\]\]\s*$/, "").replace(/\s+/g, " ").trim().toLowerCase();
 }
+function buildSilentWav(seconds = 0.4, sampleRate = 16e3) {
+  const samples = Math.floor(seconds * sampleRate);
+  const dataSize = samples * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, text) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  return buffer;
+}
 var VoiceTodoPlugin = class extends import_obsidian3.Plugin {
   constructor() {
     super(...arguments);
@@ -441,6 +464,13 @@ var VoiceTodoPlugin = class extends import_obsidian3.Plugin {
     this.timerId = null;
     this.lastAudioPath = null;
     this.busy = false;
+    /** 内存里的最近错误，诊断报告会带上（不落盘、不上传） */
+    this.diagLog = [];
+  }
+  diag(message) {
+    this.diagLog.push(`${(0, import_obsidian3.moment)().format("MM-DD HH:mm:ss")} ${message}`);
+    if (this.diagLog.length > 60) this.diagLog.shift();
+    console.log(`[voice-todo] ${message}`);
   }
   async onload() {
     await this.loadSettings();
@@ -500,6 +530,16 @@ var VoiceTodoPlugin = class extends import_obsidian3.Plugin {
       callback: () => void this.aggregateTodos()
     });
     this.addCommand({
+      id: "write-diagnostic-report",
+      name: "\u751F\u6210\u8BCA\u65AD\u62A5\u544A",
+      callback: () => void this.writeDiagnosticReport()
+    });
+    this.addCommand({
+      id: "test-cloud-connectivity",
+      name: "\u6D4B\u8BD5\u4E91\u7AEF\u8F6C\u5199\u8FDE\u901A",
+      callback: () => void this.testCloudConnectivity()
+    });
+    this.addCommand({
       id: "open-last-audio",
       name: "\u6253\u5F00\u6700\u8FD1\u4E00\u6BB5\u5F55\u97F3",
       checkCallback: (checking) => {
@@ -513,6 +553,10 @@ var VoiceTodoPlugin = class extends import_obsidian3.Plugin {
     });
     this.addSettingTab(new VoiceTodoSettingTab(this.app, this));
     this.registerMarkdownPostProcessor((el, ctx) => this.addRetryButton(el, ctx.sourcePath));
+    this.app.workspace.onLayoutReady(() => {
+      void this.sweepPendingNotes();
+    });
+    this.registerInterval(window.setInterval(() => void this.sweepPendingNotes(), 10 * 60 * 1e3));
   }
   onunload() {
     this.clearTimer();
@@ -564,7 +608,7 @@ var VoiceTodoPlugin = class extends import_obsidian3.Plugin {
       const marker = newMarker();
       const target = await this.attachAudio(saved.path, saved.name, result, marker);
       new import_obsidian3.Notice(`\u5DF2\u4FDD\u5B58\uFF1A${saved.path}`);
-      if (this.settings.autoTranscribe && import_obsidian3.Platform.isDesktopApp && target) {
+      if (this.settings.autoTranscribe && target) {
         void this.runTranscription(target, saved.path, marker);
       }
     } catch (err) {
@@ -623,7 +667,7 @@ ${placeholder}
       "source: voice",
       `duration: ${formatDuration(result.durationMs)}`
     ];
-    if (import_obsidian3.Platform.isDesktopApp) frontmatter.push(`audio: "${audioPath}"`);
+    frontmatter.push(`audio: "${audioPath}"`);
     frontmatter.push("---");
     const content = [
       ...frontmatter,
@@ -649,6 +693,10 @@ ${placeholder}
     this.busy = true;
     (_a = this.statusEl) == null ? void 0 : _a.setText("\u{1F4DD} \u8F6C\u5199\u4E2D");
     try {
+      if (!import_obsidian3.Platform.isDesktopApp && !this.getAsrKey()) {
+        await this.replacePlaceholder(file, marker, "> \u23F8 \u624B\u673A\u672A\u914D\u7F6E\u4E91\u7AEF\u8F6C\u5199 key\uFF0C\u7B49\u7535\u8111\u8865\u8F6C\uFF08\u97F3\u9891\u5DF2\u4FDD\u7559\uFF09", true);
+        return;
+      }
       const raw = await this.transcribeAudio(audioPath);
       const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
       await this.replacePlaceholder(file, marker, text || "\uFF08\u6CA1\u6709\u8BC6\u522B\u5230\u8BED\u97F3\uFF09");
@@ -661,6 +709,7 @@ ${placeholder}
       const msg = err instanceof Error ? err.message : String(err);
       await this.replacePlaceholder(file, marker, `> \u26A0\uFE0F \u8F6C\u5199\u5931\u8D25\uFF1A${msg}`, true);
       new import_obsidian3.Notice(`\u8F6C\u5199\u5931\u8D25\uFF1A${msg}`, 8e3);
+      this.diag(`\u8F6C\u5199\u5931\u8D25\uFF08${file.path}\uFF09\uFF1A${msg}`);
       console.error("[voice-todo] transcribe failed", err);
     } finally {
       this.busy = false;
@@ -669,22 +718,15 @@ ${placeholder}
   }
   /** 手动转写当前笔记里第一个音频嵌入 */
   async transcribeNoteAudio(file, force = null) {
-    var _a;
     const content = await this.app.vault.read(file);
-    const match = content.match(/!\[\[([^\]|#]+?)\]\].*?/);
-    const link = (_a = match == null ? void 0 : match[1]) == null ? void 0 : _a.trim();
-    if (!link || !AUDIO_EXT.test(link)) {
-      new import_obsidian3.Notice("\u8FD9\u6761\u7B14\u8BB0\u91CC\u6CA1\u627E\u5230\u97F3\u9891\u5D4C\u5165\uFF08![[xxx.webm]]\uFF09");
-      return;
-    }
-    const dest = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
-    if (!dest) {
-      new import_obsidian3.Notice(`\u627E\u4E0D\u5230\u97F3\u9891\u6587\u4EF6\uFF1A${link}`);
+    const audioPath = this.resolveAudioPath(content, file.path);
+    if (!audioPath) {
+      new import_obsidian3.Notice("\u8FD9\u6761\u7B14\u8BB0\u91CC\u6CA1\u627E\u5230\u97F3\u9891\uFF08\u6CA1\u6709 ![[xxx.webm]] \u5D4C\u5165\uFF0Cfrontmatter \u4E5F\u6CA1\u6709 audio \u5B57\u6BB5\uFF09");
       return;
     }
     new import_obsidian3.Notice("\u5F00\u59CB\u8F6C\u5199\u2026");
     try {
-      const raw = await this.transcribeAudio(dest.path, force);
+      const raw = await this.transcribeAudio(audioPath, force);
       const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
       await this.writeTranscriptSection(file, text || "\uFF08\u6CA1\u6709\u8BC6\u522B\u5230\u8BED\u97F3\uFF09");
       new import_obsidian3.Notice("\u8F6C\u5199\u5B8C\u6210");
@@ -694,6 +736,7 @@ ${placeholder}
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       new import_obsidian3.Notice(`\u8F6C\u5199\u5931\u8D25\uFF1A${msg}`, 8e3);
+      this.diag(`\u7B14\u8BB0\u8F6C\u5199\u5931\u8D25\uFF08${file.path}\uFF09\uFF1A${msg}`);
       console.error("[voice-todo] transcribe note failed", err);
     }
   }
@@ -748,6 +791,240 @@ ${line}
 `;
     }
     await this.app.vault.modify(file, next);
+  }
+  /** 云端请求本身没有超时，挂起后会把 busy 永久钉死；统一套一层超时 */
+  withTimeout(p, ms, label) {
+    return Promise.race([
+      p,
+      new Promise(
+        (_, reject) => window.setTimeout(() => reject(new Error(`${label}\u8D85\u65F6\uFF08${Math.round(ms / 1e3)} \u79D2\uFF09`)), ms)
+      )
+    ]);
+  }
+  /** 依次尝试：嵌入链接 → frontmatter 的 audio → 按笔记名里的时间戳猜 _mobile / 年份目录 */
+  resolveAudioPath(content, notePath) {
+    var _a, _b, _c, _d, _e, _f;
+    const embed = (_c = (_b = (_a = content.match(/!\[\[([^\]|#]+?)\]\]/)) == null ? void 0 : _a[1]) == null ? void 0 : _b.trim()) != null ? _c : "";
+    const fm = (_f = (_e = (_d = content.match(/\baudio:\s*"?([^"\n]+)"?/)) == null ? void 0 : _d[1]) == null ? void 0 : _e.trim()) != null ? _f : "";
+    const candidates = [];
+    if (embed && AUDIO_EXT.test(embed)) candidates.push(embed);
+    if (fm && AUDIO_EXT.test(fm)) candidates.push(fm);
+    const stamp = notePath.match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2})(\d{2})(\d{2})/);
+    if (stamp) {
+      const year = stamp[1];
+      const id = `${stamp[1]}${stamp[2]}${stamp[3]}-${stamp[4]}${stamp[5]}${stamp[6]}`;
+      const base = trimSlashes(this.settings.audioFolder) || "\u9644\u4EF6/\u5F55\u97F3";
+      for (const ext of ["webm", "m4a", "mp3", "wav", "ogg", "opus", "mp4"]) {
+        candidates.push(`${base}/_mobile/${id}.${ext}`, `${base}/${year}/${id}.${ext}`);
+      }
+    }
+    for (const candidate of candidates) {
+      const direct = this.app.vault.getAbstractFileByPath((0, import_obsidian3.normalizePath)(candidate));
+      if (direct instanceof import_obsidian3.TFile) return direct.path;
+      const dest = this.app.metadataCache.getFirstLinkpathDest(candidate, notePath);
+      if (dest) return dest.path;
+    }
+    return null;
+  }
+  /** 桌面端兜底：扫「语音笔记」里停住的条目，用本地 whisper 补转 */
+  async sweepPendingNotes() {
+    if (!import_obsidian3.Platform.isDesktopApp || this.busy) return;
+    const folder = (0, import_obsidian3.normalizePath)(trimSlashes(this.settings.noteFolder) || "\u8BED\u97F3\u7B14\u8BB0");
+    const files = this.app.vault.getMarkdownFiles().filter((f) => f.path === folder || f.path.startsWith(`${folder}/`));
+    for (const file of files) {
+      if (this.busy) return;
+      if (Date.now() - file.stat.mtime < 9e4) continue;
+      const content = await this.app.vault.read(file);
+      if (!content.includes("\u23F3 \u8F6C\u5199\u4E2D") && !content.includes("\u7B49\u7535\u8111\u8865\u8F6C")) continue;
+      const audioPath = this.resolveAudioPath(content, file.path);
+      if (!audioPath) continue;
+      await this.transcribeQueuedFile(file, audioPath);
+    }
+  }
+  async transcribeQueuedFile(file, audioPath) {
+    var _a, _b;
+    this.busy = true;
+    (_a = this.statusEl) == null ? void 0 : _a.setText("\u{1F4DD} \u8865\u8F6C\u4E2D");
+    try {
+      const raw = await this.transcribeAudio(audioPath, "local");
+      const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
+      await this.writeTranscriptSection(file, text || "\uFF08\u6CA1\u6709\u8BC6\u522B\u5230\u8BED\u97F3\uFF09");
+      console.log(`[voice-todo] \u8865\u8F6C\u5B8C\u6210\uFF1A${file.path}`);
+      if (this.settings.autoPolish && this.getApiKey()) {
+        await this.runPolish(file, text);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.diag(`\u8865\u8F6C\u5931\u8D25\uFF08${file.path}\uFF09\uFF1A${msg}`);
+      console.error("[voice-todo] \u8865\u8F6C\u5931\u8D25", file.path, err);
+    } finally {
+      this.busy = false;
+      (_b = this.statusEl) == null ? void 0 : _b.setText("\u{1F399} \u5C31\u7EEA");
+    }
+  }
+  async openReport(prefix, body) {
+    const path = (0, import_obsidian3.normalizePath)(`${prefix} ${(0, import_obsidian3.moment)().format("YYYY-MM-DD HHmmss")}.md`);
+    try {
+      const file = await this.app.vault.create(path, `${body}
+`);
+      await this.app.workspace.getLeaf(true).openFile(file);
+      new import_obsidian3.Notice(`\u62A5\u544A\u5DF2\u751F\u6210\uFF1A${path}`, 6e3);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new import_obsidian3.Notice(`\u62A5\u544A\u5199\u5165\u5931\u8D25\uFF1A${msg}`, 8e3);
+      this.diag(`\u62A5\u544A\u5199\u5165\u5931\u8D25\uFF1A${msg}`);
+    }
+  }
+  /** 诊断报告：配置 + 目录状态 + 待转写条目 + 最近错误。纯本地，不发任何网络请求 */
+  async writeDiagnosticReport() {
+    const s = this.settings;
+    const audioBase = (0, import_obsidian3.normalizePath)(trimSlashes(s.audioFolder) || "\u9644\u4EF6/\u5F55\u97F3");
+    const noteFolder = (0, import_obsidian3.normalizePath)(trimSlashes(s.noteFolder) || "\u8BED\u97F3\u7B14\u8BB0");
+    const all = this.app.vault.getFiles();
+    const audioFiles = all.filter((f) => f.path.startsWith(`${audioBase}/`) && AUDIO_EXT.test(f.path));
+    const mobileAudio = audioFiles.filter((f) => f.path.includes("/_mobile/"));
+    const audioBytes = audioFiles.reduce((sum, f) => sum + f.stat.size, 0);
+    const notes = all.filter(
+      (f) => f.extension === "md" && (f.path === noteFolder || f.path.startsWith(`${noteFolder}/`))
+    );
+    const out = [];
+    out.push("# \u8BED\u97F3\u5F85\u529E \u8BCA\u65AD\u62A5\u544A", "");
+    out.push(`- \u751F\u6210\u65F6\u95F4\uFF1A${(0, import_obsidian3.moment)().format("YYYY-MM-DD HH:mm:ss")}`);
+    out.push(`- \u5E73\u53F0\uFF1A${import_obsidian3.Platform.isDesktopApp ? "\u684C\u9762\u7AEF" : "\u79FB\u52A8\u7AEF"}`);
+    out.push(`- \u63D2\u4EF6\u7248\u672C\uFF1A${this.manifest.version}`);
+    out.push(`- \u4ED3\u5E93\uFF1A${this.app.vault.getName()}`);
+    out.push(`- \u62A5\u544A\u4E0D\u542B\u4EFB\u4F55 API Key\uFF0C\u4E5F\u4E0D\u542B\u7B14\u8BB0\u6B63\u6587\u548C\u8F6C\u5199\u5185\u5BB9`, "");
+    out.push("## \u8F6C\u5199\u914D\u7F6E", "");
+    out.push(`- \u505C\u5F55\u540E\u81EA\u52A8\u8F6C\u5199\uFF1A${s.autoTranscribe ? "\u5F00" : "\u5173"}`);
+    out.push(`- \u8F6C\u5199\u5F15\u64CE\uFF1A${s.transcribeEngine}\uFF08\u624B\u673A\u7AEF\u5F3A\u5236\u8D70\u4E91\u7AEF\uFF09`);
+    out.push(`- \u4E91\u7AEF\u63A5\u53E3\u5730\u5740\uFF1A${s.cloudBaseUrl}`);
+    out.push(`- \u4E91\u7AEF\u6A21\u578B\uFF1A${s.cloudModel}`);
+    out.push(`- \u4E91\u7AEF\u8F6C\u5199 key\uFF1A${this.getAsrKey() ? "\u5DF2\u914D\u7F6E" : "\u672A\u914D\u7F6E"}`);
+    out.push(`- DeepSeek key\uFF08AI \u6574\u7406\uFF09\uFF1A${this.hasApiKey() ? "\u5DF2\u914D\u7F6E" : "\u672A\u914D\u7F6E"}`);
+    out.push(`- \u8F6C\u5199\u540E\u81EA\u52A8\u6574\u7406\uFF1A${s.autoPolish ? "\u5F00" : "\u5173"}`);
+    out.push(`- \u672C\u5730\u6A21\u578B\uFF1A${s.whisperModel} / \u8BED\u8A00 ${s.whisperLang}`);
+    out.push("");
+    if (import_obsidian3.Platform.isDesktopApp) {
+      out.push("## \u672C\u673A\u5DE5\u5177\u94FE\uFF08\u4EC5\u684C\u9762\u7AEF\uFF09", "");
+      try {
+        const req = window.require;
+        const fs = req ? req("fs") : null;
+        if (!fs) out.push("- \u62FF\u4E0D\u5230 fs \u6A21\u5757\uFF0C\u8DF3\u8FC7\u8DEF\u5F84\u68C0\u67E5");
+        else {
+          const check = (label, p) => out.push(`- ${label}\uFF1A${p} ${fs.existsSync(p) ? "\u2705" : "\u274C \u4E0D\u5B58\u5728"}`);
+          check("python.exe", s.pythonPath);
+          check("\u8F6C\u5199\u811A\u672C", s.scriptPath);
+          check("ffmpeg \u76EE\u5F55", s.ffmpegDir);
+          check("ASR \u6570\u636E\u76EE\u5F55", s.asrHome);
+        }
+      } catch (err) {
+        out.push(`- \u8BFB\u53D6\u672C\u673A\u8DEF\u5F84\u5931\u8D25\uFF1A${err instanceof Error ? err.message : String(err)}`);
+      }
+      out.push("");
+    }
+    out.push("## \u76EE\u5F55\u4E0E\u6587\u4EF6", "");
+    out.push(`- \u5F55\u97F3\u76EE\u5F55\uFF1A${audioBase} ${this.app.vault.getAbstractFileByPath(audioBase) ? "\u2705" : "\u274C \u4E0D\u5B58\u5728"}`);
+    out.push(`- \u8BED\u97F3\u7B14\u8BB0\u76EE\u5F55\uFF1A${noteFolder} ${this.app.vault.getAbstractFileByPath(noteFolder) ? "\u2705" : "\u274C \u4E0D\u5B58\u5728"}`);
+    out.push(`- \u97F3\u9891\u6587\u4EF6\uFF1A${audioFiles.length} \u4E2A\uFF0C\u5171 ${(audioBytes / 1024 / 1024).toFixed(1)} MB\uFF08\u5176\u4E2D _mobile/ \u4E0B ${mobileAudio.length} \u4E2A\uFF09`);
+    out.push(`- \u7B14\u8BB0\u6761\u6570\uFF1A${notes.length}`);
+    out.push("");
+    out.push("## \u5F85\u8F6C\u5199 / \u5931\u8D25\u7684\u6761\u76EE", "");
+    let pendingCount = 0;
+    for (const note of notes) {
+      const content = await this.app.vault.read(note);
+      const state = content.includes("\u23F3 \u8F6C\u5199\u4E2D") ? "\u23F3 \u5361\u5728\u8F6C\u5199\u4E2D" : content.includes("\u7B49\u7535\u8111\u8865\u8F6C") ? "\u23F8 \u7B49\u7535\u8111\u8865\u8F6C" : content.includes("\u8F6C\u5199\u5931\u8D25") ? "\u26A0\uFE0F \u8F6C\u5199\u5931\u8D25" : content.includes("## \u8F6C\u5199") ? "\u2705 \u6709\u8F6C\u5199" : "\uFF08\u65E0\u8F6C\u5199\u6BB5\uFF09";
+      if (state.startsWith("\u2705") || state.startsWith("\uFF08")) continue;
+      pendingCount += 1;
+      if (pendingCount > 20) continue;
+      const audio = this.resolveAudioPath(content, note.path);
+      out.push(
+        `- ${(0, import_obsidian3.moment)(note.stat.mtime).format("MM-DD HH:mm")} \uFF5C ${note.path} \uFF5C ${state} \uFF5C \u97F3\u9891\uFF1A${audio != null ? audio : "\u274C \u627E\u4E0D\u5230"}`
+      );
+    }
+    if (pendingCount === 0) out.push("- \u6CA1\u6709\u5361\u4F4F\u7684\u6761\u76EE");
+    out.push("");
+    out.push("## \u6700\u8FD1\u9519\u8BEF\uFF08\u5185\u5B58\uFF0C\u5237\u65B0\u540E\u6E05\u7A7A\uFF09", "");
+    if (this.diagLog.length === 0) out.push("- \u65E0");
+    else for (const line of this.diagLog.slice(-30)) out.push(`- ${line}`);
+    await this.openReport("\u8BED\u97F3\u5F85\u529E \u8BCA\u65AD\u62A5\u544A", out.join("\n"));
+  }
+  /** 测试云端连通：先拉模型列表验 key，再用 0.4 秒静音音频真跑一次转写 */
+  async testCloudConnectivity() {
+    const s = this.settings;
+    const base = (s.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl).replace(/\/+$/, "");
+    const model = s.cloudModel || DEFAULT_SETTINGS.cloudModel;
+    const key = this.getAsrKey();
+    const out = [];
+    out.push("# \u8BED\u97F3\u5F85\u529E \u4E91\u7AEF\u8FDE\u901A\u6D4B\u8BD5", "");
+    out.push(`- \u65F6\u95F4\uFF1A${(0, import_obsidian3.moment)().format("YYYY-MM-DD HH:mm:ss")}`);
+    out.push(`- \u5E73\u53F0\uFF1A${import_obsidian3.Platform.isDesktopApp ? "\u684C\u9762\u7AEF" : "\u79FB\u52A8\u7AEF"}`);
+    out.push(`- \u63A5\u53E3\u5730\u5740\uFF1A${base}`);
+    out.push(`- \u6A21\u578B\uFF1A${model}`);
+    out.push(
+      `- API Key\uFF1A${key ? `\u5DF2\u914D\u7F6E\uFF08${key.slice(0, 3)}\u2026${key.slice(-2)}\uFF0C\u5171 ${key.length} \u4F4D\uFF09` : "\u672A\u914D\u7F6E"}`
+    );
+    out.push("");
+    if (!key) {
+      out.push("## \u7ED3\u8BBA", "", "\u274C \u6CA1\u6709 API Key\uFF0C\u6CA1\u6CD5\u6D4B\u3002\u53BB\u300C\u8BBE\u7F6E \u2192 \u8BED\u97F3\u5F85\u529E \u2192 \u4E91\u7AEF\u8F6C\u5199 \u2192 \u4E91\u7AEF\u8F6C\u5199 API Key\u300D\u586B\u4E00\u4E2A\u3002");
+      await this.openReport("\u8BED\u97F3\u5F85\u529E \u8FDE\u901A\u6D4B\u8BD5", out.join("\n"));
+      return;
+    }
+    const t1 = Date.now();
+    try {
+      const resp = await this.withTimeout(
+        (0, import_obsidian3.requestUrl)({
+          url: `${base}/models`,
+          method: "GET",
+          headers: { Authorization: `Bearer ${key}` },
+          throw: false
+        }),
+        15e3,
+        "\u62C9\u53D6\u6A21\u578B\u5217\u8868"
+      );
+      out.push("## 1. \u9274\u6743\u4E0E\u7F51\u7EDC\uFF08GET /models\uFF09", "", `- \u72B6\u6001\u7801\uFF1A${resp.status}`, `- \u8017\u65F6\uFF1A${Date.now() - t1} ms`);
+      if (resp.status >= 400) {
+        out.push(`- \u8FD4\u56DE\u7247\u6BB5\uFF1A${(resp.text || "").slice(0, 300)}`);
+        out.push("- \u7ED3\u8BBA\uFF1A\u274C key \u6216\u63A5\u53E3\u5730\u5740\u4E0D\u5BF9");
+      } else {
+        out.push("- \u7ED3\u8BBA\uFF1A\u2705 \u7F51\u7EDC\u901A\u3001key \u88AB\u63A5\u53D7");
+      }
+    } catch (err) {
+      out.push(
+        "## 1. \u9274\u6743\u4E0E\u7F51\u7EDC\uFF08GET /models\uFF09",
+        "",
+        `- \u274C ${err instanceof Error ? err.message : String(err)}`,
+        `- \u8017\u65F6\uFF1A${Date.now() - t1} ms`
+      );
+    }
+    const t2 = Date.now();
+    try {
+      const text = await this.withTimeout(
+        transcribeCloud({
+          baseUrl: base,
+          apiKey: key,
+          model,
+          audio: buildSilentWav(),
+          filename: "silence.wav",
+          mime: "audio/wav",
+          language: void 0
+        }),
+        6e4,
+        "\u4E91\u7AEF\u8F6C\u5199\u63A5\u53E3"
+      );
+      out.push("", "## 2. \u8F6C\u5199\u63A5\u53E3\uFF08POST /audio/transcriptions\uFF09", "");
+      out.push(`- \u8017\u65F6\uFF1A${Date.now() - t2} ms`);
+      out.push(`- \u8FD4\u56DE\u6587\u672C\uFF1A${text ? `\u300C${text}\u300D` : "\uFF08\u7A7A\uFF0C\u9759\u97F3\u97F3\u9891\u5C5E\u6B63\u5E38\uFF09"}`);
+      out.push("- \u7ED3\u8BBA\uFF1A\u2705 \u6574\u6761\u94FE\u8DEF\u53EF\u7528");
+      new import_obsidian3.Notice("\u4E91\u7AEF\u8F6C\u5199\u8FDE\u901A\uFF1A\u6B63\u5E38");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      out.push("", "## 2. \u8F6C\u5199\u63A5\u53E3\uFF08POST /audio/transcriptions\uFF09", "");
+      out.push(`- \u274C ${msg}`);
+      out.push(`- \u8017\u65F6\uFF1A${Date.now() - t2} ms`);
+      new import_obsidian3.Notice(`\u4E91\u7AEF\u8F6C\u5199\u5931\u8D25\uFF1A${msg}`, 8e3);
+      this.diag(`\u4E91\u7AEF\u8FDE\u901A\u6D4B\u8BD5\u5931\u8D25\uFF1A${msg}`);
+    }
+    await this.openReport("\u8BED\u97F3\u5F85\u529E \u8FDE\u901A\u6D4B\u8BD5", out.join("\n"));
   }
   /** 把扫描目录里的未完成待办汇总到 Todo 笔记，按文本去重 */
   async aggregateTodos() {
@@ -866,15 +1143,19 @@ ${line}
     const audio = await this.app.vault.adapter.readBinary(vaultPath);
     const filename = vaultPath.split("/").pop() || "audio.webm";
     const mime = filename.endsWith(".m4a") ? "audio/mp4" : filename.endsWith(".mp3") ? "audio/mpeg" : filename.endsWith(".wav") ? "audio/wav" : filename.endsWith(".ogg") ? "audio/ogg" : "audio/webm";
-    return transcribeCloud({
-      baseUrl: this.settings.cloudBaseUrl,
-      apiKey: key,
-      model: this.settings.cloudModel,
-      audio,
-      filename,
-      mime,
-      language: this.settings.whisperLang === "auto" ? void 0 : this.settings.whisperLang
-    });
+    return this.withTimeout(
+      transcribeCloud({
+        baseUrl: this.settings.cloudBaseUrl,
+        apiKey: key,
+        model: this.settings.cloudModel,
+        audio,
+        filename,
+        mime,
+        language: this.settings.whisperLang === "auto" ? void 0 : this.settings.whisperLang
+      }),
+      12e4,
+      "\u4E91\u7AEF\u8F6C\u5199"
+    );
   }
   /** 在「整理失败 / 转写失败」提示后面挂一个重试按钮 */
   addRetryButton(el, sourcePath) {
@@ -1244,6 +1525,13 @@ var VoiceTodoSettingTab = class extends import_obsidian3.PluginSettingTab {
         this.plugin.settings.todoScanFolder = value.trim() || DEFAULT_SETTINGS.todoScanFolder;
         await this.plugin.saveSettings();
       })
+    );
+    new import_obsidian3.Setting(containerEl).setName("\u8BCA\u65AD\uFF08\u624B\u673A\u7AEF\u4E5F\u80FD\u7528\uFF09").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("\u751F\u6210\u8BCA\u65AD\u62A5\u544A").setDesc("\u628A\u914D\u7F6E\u3001\u76EE\u5F55\u72B6\u6001\u3001\u5361\u4F4F\u7684\u6761\u76EE\u548C\u6700\u8FD1\u9519\u8BEF\u5199\u6210\u4E00\u7BC7\u7B14\u8BB0\u653E\u5728\u4ED3\u5E93\u6839\u76EE\u5F55\u3002\u7EAF\u672C\u5730\uFF0C\u4E0D\u53D1\u7F51\u7EDC\u8BF7\u6C42\u3002").addButton(
+      (btn) => btn.setButtonText("\u751F\u6210").onClick(() => void this.plugin.writeDiagnosticReport())
+    );
+    new import_obsidian3.Setting(containerEl).setName("\u6D4B\u8BD5\u4E91\u7AEF\u8FDE\u901A").setDesc("\u5148\u62C9\u4E00\u6B21\u6A21\u578B\u5217\u8868\u9A8C\u8BC1 key\uFF0C\u518D\u7528 0.4 \u79D2\u9759\u97F3\u97F3\u9891\u771F\u8DD1\u4E00\u6B21\u8F6C\u5199\uFF1B\u5171\u4E24\u4E2A\u8BF7\u6C42\uFF0C\u4E0D\u4F20\u4F60\u7684\u5F55\u97F3\u3002").addButton(
+      (btn) => btn.setButtonText("\u5F00\u59CB\u6D4B\u8BD5").onClick(() => void this.plugin.testCloudConnectivity())
     );
   }
 };
