@@ -1,0 +1,9 @@
+{
+	"id": "voice-todo",
+	"name": "语音待办",
+	"version": "0.1.0",
+	"minAppVersion": "1.11.4",
+	"description": "录音、转写、AI 整理，并把待办写进笔记。",
+	"author": "theon",
+	"isDesktopOnly": false
+}
