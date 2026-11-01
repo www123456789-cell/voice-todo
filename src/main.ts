@@ -9,6 +9,7 @@ import {
 	TFile,
 	moment,
 	normalizePath,
+	requestUrl,
 } from "obsidian";
 import { RecordingResult, VoiceRecorder } from "./recorder";
 import { LocalWhisperTranscriber } from "./transcribe";
@@ -45,6 +46,31 @@ function normalizeTaskText(raw: string): string {
 		.toLowerCase();
 }
 
+/** 生成一段静音 wav，给「测试云端连通」用：只验证接口与 key，不传用户音频 */
+function buildSilentWav(seconds = 0.4, sampleRate = 16000): ArrayBuffer {
+	const samples = Math.floor(seconds * sampleRate);
+	const dataSize = samples * 2;
+	const buffer = new ArrayBuffer(44 + dataSize);
+	const view = new DataView(buffer);
+	const writeStr = (offset: number, text: string) => {
+		for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+	};
+	writeStr(0, "RIFF");
+	view.setUint32(4, 36 + dataSize, true);
+	writeStr(8, "WAVE");
+	writeStr(12, "fmt ");
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, 1, true);
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * 2, true);
+	view.setUint16(32, 2, true);
+	view.setUint16(34, 16, true);
+	writeStr(36, "data");
+	view.setUint32(40, dataSize, true);
+	return buffer;
+}
+
 export default class VoiceTodoPlugin extends Plugin {
 	settings: VoiceTodoSettings = { ...DEFAULT_SETTINGS };
 
@@ -54,6 +80,14 @@ export default class VoiceTodoPlugin extends Plugin {
 	private timerId: number | null = null;
 	private lastAudioPath: string | null = null;
 	private busy = false;
+	/** 内存里的最近错误，诊断报告会带上（不落盘、不上传） */
+	private readonly diagLog: string[] = [];
+
+	private diag(message: string): void {
+		this.diagLog.push(`${moment().format("MM-DD HH:mm:ss")} ${message}`);
+		if (this.diagLog.length > 60) this.diagLog.shift();
+		console.log(`[voice-todo] ${message}`);
+	}
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -122,6 +156,18 @@ export default class VoiceTodoPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "write-diagnostic-report",
+			name: "生成诊断报告",
+			callback: () => void this.writeDiagnosticReport(),
+		});
+
+		this.addCommand({
+			id: "test-cloud-connectivity",
+			name: "测试云端转写连通",
+			callback: () => void this.testCloudConnectivity(),
+		});
+
+		this.addCommand({
 			id: "open-last-audio",
 			name: "打开最近一段录音",
 			checkCallback: (checking: boolean) => {
@@ -137,6 +183,13 @@ export default class VoiceTodoPlugin extends Plugin {
 		this.addSettingTab(new VoiceTodoSettingTab(this.app, this));
 
 		this.registerMarkdownPostProcessor((el, ctx) => this.addRetryButton(el, ctx.sourcePath));
+
+		// 桌面端兜底：手机没配云端转写 key、或云端请求被打断时，笔记会停在「⏳ 转写中」。
+		// 这里启动后扫一遍，之后每 10 分钟一次，用本地 whisper 补转。
+		this.app.workspace.onLayoutReady(() => {
+			void this.sweepPendingNotes();
+		});
+		this.registerInterval(window.setInterval(() => void this.sweepPendingNotes(), 10 * 60 * 1000));
 	}
 
 	onunload(): void {
@@ -191,7 +244,7 @@ export default class VoiceTodoPlugin extends Plugin {
 			const marker = newMarker();
 			const target = await this.attachAudio(saved.path, saved.name, result, marker);
 			new Notice(`已保存：${saved.path}`);
-			if (this.settings.autoTranscribe && Platform.isDesktopApp && target) {
+			if (this.settings.autoTranscribe && target) {
 				void this.runTranscription(target, saved.path, marker);
 			}
 		} catch (err) {
@@ -261,7 +314,7 @@ export default class VoiceTodoPlugin extends Plugin {
 			"source: voice",
 			`duration: ${formatDuration(result.durationMs)}`,
 		];
-		if (Platform.isDesktopApp) frontmatter.push(`audio: "${audioPath}"`);
+		frontmatter.push(`audio: "${audioPath}"`);
 		frontmatter.push("---");
 
 		const content = [
@@ -289,6 +342,12 @@ export default class VoiceTodoPlugin extends Plugin {
 		this.busy = true;
 		this.statusEl?.setText("📝 转写中");
 		try {
+			// 手机端只能走云端；没配 key 时不写死错误，留一个「等电脑补转」的占位，
+			// 音频和 audio 字段都保留，桌面端的定时扫描会用本地 whisper 补上。
+			if (!Platform.isDesktopApp && !this.getAsrKey()) {
+				await this.replacePlaceholder(file, marker, "> ⏸ 手机未配置云端转写 key，等电脑补转（音频已保留）", true);
+				return;
+			}
 			const raw = await this.transcribeAudio(audioPath);
 			const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
 			await this.replacePlaceholder(file, marker, text || "（没有识别到语音）");
@@ -301,6 +360,7 @@ export default class VoiceTodoPlugin extends Plugin {
 			const msg = err instanceof Error ? err.message : String(err);
 			await this.replacePlaceholder(file, marker, `> ⚠️ 转写失败：${msg}`, true);
 			new Notice(`转写失败：${msg}`, 8000);
+			this.diag(`转写失败（${file.path}）：${msg}`);
 			console.error("[voice-todo] transcribe failed", err);
 		} finally {
 			this.busy = false;
@@ -311,21 +371,15 @@ export default class VoiceTodoPlugin extends Plugin {
 	/** 手动转写当前笔记里第一个音频嵌入 */
 	private async transcribeNoteAudio(file: TFile, force: "local" | "cloud" | null = null): Promise<void> {
 		const content = await this.app.vault.read(file);
-		const match = content.match(/!\[\[([^\]|#]+?)\]\].*?/);
-		const link = match?.[1]?.trim();
-		if (!link || !AUDIO_EXT.test(link)) {
-			new Notice("这条笔记里没找到音频嵌入（![[xxx.webm]]）");
-			return;
-		}
-		const dest = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
-		if (!dest) {
-			new Notice(`找不到音频文件：${link}`);
+		const audioPath = this.resolveAudioPath(content, file.path);
+		if (!audioPath) {
+			new Notice("这条笔记里没找到音频（没有 ![[xxx.webm]] 嵌入，frontmatter 也没有 audio 字段）");
 			return;
 		}
 
 		new Notice("开始转写…");
 		try {
-			const raw = await this.transcribeAudio(dest.path, force);
+			const raw = await this.transcribeAudio(audioPath, force);
 			const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
 			await this.writeTranscriptSection(file, text || "（没有识别到语音）");
 			new Notice("转写完成");
@@ -335,6 +389,7 @@ export default class VoiceTodoPlugin extends Plugin {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			new Notice(`转写失败：${msg}`, 8000);
+			this.diag(`笔记转写失败（${file.path}）：${msg}`);
 			console.error("[voice-todo] transcribe note failed", err);
 		}
 	}
@@ -387,6 +442,272 @@ export default class VoiceTodoPlugin extends Plugin {
 					: `${current.replace(/\s*$/, "")}\n\n${line}\n`;
 		}
 		await this.app.vault.modify(file, next);
+	}
+
+	/** 云端请求本身没有超时，挂起后会把 busy 永久钉死；统一套一层超时 */
+	private withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+		return Promise.race([
+			p,
+			new Promise<never>((_, reject) =>
+				window.setTimeout(() => reject(new Error(`${label}超时（${Math.round(ms / 1000)} 秒）`)), ms),
+			),
+		]);
+	}
+
+	/** 依次尝试：嵌入链接 → frontmatter 的 audio → 按笔记名里的时间戳猜 _mobile / 年份目录 */
+	private resolveAudioPath(content: string, notePath: string): string | null {
+		const embed = content.match(/!\[\[([^\]|#]+?)\]\]/)?.[1]?.trim() ?? "";
+		const fm = content.match(/\baudio:\s*"?([^"\n]+)"?/)?.[1]?.trim() ?? "";
+
+		const candidates: string[] = [];
+		if (embed && AUDIO_EXT.test(embed)) candidates.push(embed);
+		if (fm && AUDIO_EXT.test(fm)) candidates.push(fm);
+
+		const stamp = notePath.match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2})(\d{2})(\d{2})/);
+		if (stamp) {
+			const year = stamp[1];
+			const id = `${stamp[1]}${stamp[2]}${stamp[3]}-${stamp[4]}${stamp[5]}${stamp[6]}`;
+			const base = trimSlashes(this.settings.audioFolder) || "附件/录音";
+			for (const ext of ["webm", "m4a", "mp3", "wav", "ogg", "opus", "mp4"]) {
+				candidates.push(`${base}/_mobile/${id}.${ext}`, `${base}/${year}/${id}.${ext}`);
+			}
+		}
+
+		for (const candidate of candidates) {
+			const direct = this.app.vault.getAbstractFileByPath(normalizePath(candidate));
+			if (direct instanceof TFile) return direct.path;
+			const dest = this.app.metadataCache.getFirstLinkpathDest(candidate, notePath);
+			if (dest) return dest.path;
+		}
+		return null;
+	}
+
+	/** 桌面端兜底：扫「语音笔记」里停住的条目，用本地 whisper 补转 */
+	private async sweepPendingNotes(): Promise<void> {
+		if (!Platform.isDesktopApp || this.busy) return;
+		const folder = normalizePath(trimSlashes(this.settings.noteFolder) || "语音笔记");
+		const files = this.app.vault
+			.getMarkdownFiles()
+			.filter((f) => f.path === folder || f.path.startsWith(`${folder}/`));
+
+		for (const file of files) {
+			if (this.busy) return;
+			// 刚写入的笔记可能正在被手机端或本机处理，先放过
+			if (Date.now() - file.stat.mtime < 90_000) continue;
+			const content = await this.app.vault.read(file);
+			if (!content.includes("⏳ 转写中") && !content.includes("等电脑补转")) continue;
+			const audioPath = this.resolveAudioPath(content, file.path);
+			if (!audioPath) continue;
+			await this.transcribeQueuedFile(file, audioPath);
+		}
+	}
+
+	private async transcribeQueuedFile(file: TFile, audioPath: string): Promise<void> {
+		this.busy = true;
+		this.statusEl?.setText("📝 补转中");
+		try {
+			const raw = await this.transcribeAudio(audioPath, "local");
+			const text = this.settings.stripEmoji ? stripEmoji(raw) : raw;
+			await this.writeTranscriptSection(file, text || "（没有识别到语音）");
+			console.log(`[voice-todo] 补转完成：${file.path}`);
+			if (this.settings.autoPolish && this.getApiKey()) {
+				await this.runPolish(file, text);
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			this.diag(`补转失败（${file.path}）：${msg}`);
+			console.error("[voice-todo] 补转失败", file.path, err);
+		} finally {
+			this.busy = false;
+			this.statusEl?.setText("🎙 就绪");
+		}
+	}
+
+	private async openReport(prefix: string, body: string): Promise<void> {
+		const path = normalizePath(`${prefix} ${moment().format("YYYY-MM-DD HHmmss")}.md`);
+		try {
+			const file = await this.app.vault.create(path, `${body}\n`);
+			await this.app.workspace.getLeaf(true).openFile(file);
+			new Notice(`报告已生成：${path}`, 6000);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			new Notice(`报告写入失败：${msg}`, 8000);
+			this.diag(`报告写入失败：${msg}`);
+		}
+	}
+
+	/** 诊断报告：配置 + 目录状态 + 待转写条目 + 最近错误。纯本地，不发任何网络请求 */
+	async writeDiagnosticReport(): Promise<void> {
+		const s = this.settings;
+		const audioBase = normalizePath(trimSlashes(s.audioFolder) || "附件/录音");
+		const noteFolder = normalizePath(trimSlashes(s.noteFolder) || "语音笔记");
+		const all = this.app.vault.getFiles();
+		const audioFiles = all.filter((f) => f.path.startsWith(`${audioBase}/`) && AUDIO_EXT.test(f.path));
+		const mobileAudio = audioFiles.filter((f) => f.path.includes("/_mobile/"));
+		const audioBytes = audioFiles.reduce((sum, f) => sum + f.stat.size, 0);
+		const notes = all.filter(
+			(f) => f.extension === "md" && (f.path === noteFolder || f.path.startsWith(`${noteFolder}/`)),
+		);
+
+		const out: string[] = [];
+		out.push("# 语音待办 诊断报告", "");
+		out.push(`- 生成时间：${moment().format("YYYY-MM-DD HH:mm:ss")}`);
+		out.push(`- 平台：${Platform.isDesktopApp ? "桌面端" : "移动端"}`);
+		out.push(`- 插件版本：${this.manifest.version}`);
+		out.push(`- 仓库：${this.app.vault.getName()}`);
+		out.push(`- 报告不含任何 API Key，也不含笔记正文和转写内容`, "");
+
+		out.push("## 转写配置", "");
+		out.push(`- 停录后自动转写：${s.autoTranscribe ? "开" : "关"}`);
+		out.push(`- 转写引擎：${s.transcribeEngine}（手机端强制走云端）`);
+		out.push(`- 云端接口地址：${s.cloudBaseUrl}`);
+		out.push(`- 云端模型：${s.cloudModel}`);
+		out.push(`- 云端转写 key：${this.getAsrKey() ? "已配置" : "未配置"}`);
+		out.push(`- DeepSeek key（AI 整理）：${this.hasApiKey() ? "已配置" : "未配置"}`);
+		out.push(`- 转写后自动整理：${s.autoPolish ? "开" : "关"}`);
+		out.push(`- 本地模型：${s.whisperModel} / 语言 ${s.whisperLang}`);
+		out.push("");
+
+		if (Platform.isDesktopApp) {
+			out.push("## 本机工具链（仅桌面端）", "");
+			try {
+				const req = (window as unknown as { require?: (m: string) => unknown }).require;
+				const fs = req ? (req("fs") as typeof import("fs")) : null;
+				if (!fs) out.push("- 拿不到 fs 模块，跳过路径检查");
+				else {
+					const check = (label: string, p: string) =>
+						out.push(`- ${label}：${p} ${fs.existsSync(p) ? "✅" : "❌ 不存在"}`);
+					check("python.exe", s.pythonPath);
+					check("转写脚本", s.scriptPath);
+					check("ffmpeg 目录", s.ffmpegDir);
+					check("ASR 数据目录", s.asrHome);
+				}
+			} catch (err) {
+				out.push(`- 读取本机路径失败：${err instanceof Error ? err.message : String(err)}`);
+			}
+			out.push("");
+		}
+
+		out.push("## 目录与文件", "");
+		out.push(`- 录音目录：${audioBase} ${this.app.vault.getAbstractFileByPath(audioBase) ? "✅" : "❌ 不存在"}`);
+		out.push(`- 语音笔记目录：${noteFolder} ${this.app.vault.getAbstractFileByPath(noteFolder) ? "✅" : "❌ 不存在"}`);
+		out.push(`- 音频文件：${audioFiles.length} 个，共 ${(audioBytes / 1024 / 1024).toFixed(1)} MB（其中 _mobile/ 下 ${mobileAudio.length} 个）`);
+		out.push(`- 笔记条数：${notes.length}`);
+		out.push("");
+
+		out.push("## 待转写 / 失败的条目", "");
+		let pendingCount = 0;
+		for (const note of notes) {
+			const content = await this.app.vault.read(note);
+			const state = content.includes("⏳ 转写中")
+				? "⏳ 卡在转写中"
+				: content.includes("等电脑补转")
+					? "⏸ 等电脑补转"
+					: content.includes("转写失败")
+						? "⚠️ 转写失败"
+						: content.includes("## 转写")
+							? "✅ 有转写"
+							: "（无转写段）";
+			if (state.startsWith("✅") || state.startsWith("（")) continue;
+			pendingCount += 1;
+			if (pendingCount > 20) continue;
+			const audio = this.resolveAudioPath(content, note.path);
+			out.push(
+				`- ${moment(note.stat.mtime).format("MM-DD HH:mm")} ｜ ${note.path} ｜ ${state} ｜ 音频：${audio ?? "❌ 找不到"}`,
+			);
+		}
+		if (pendingCount === 0) out.push("- 没有卡住的条目");
+		out.push("");
+
+		out.push("## 最近错误（内存，刷新后清空）", "");
+		if (this.diagLog.length === 0) out.push("- 无");
+		else for (const line of this.diagLog.slice(-30)) out.push(`- ${line}`);
+
+		await this.openReport("语音待办 诊断报告", out.join("\n"));
+	}
+
+	/** 测试云端连通：先拉模型列表验 key，再用 0.4 秒静音音频真跑一次转写 */
+	async testCloudConnectivity(): Promise<void> {
+		const s = this.settings;
+		const base = (s.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl).replace(/\/+$/, "");
+		const model = s.cloudModel || DEFAULT_SETTINGS.cloudModel;
+		const key = this.getAsrKey();
+
+		const out: string[] = [];
+		out.push("# 语音待办 云端连通测试", "");
+		out.push(`- 时间：${moment().format("YYYY-MM-DD HH:mm:ss")}`);
+		out.push(`- 平台：${Platform.isDesktopApp ? "桌面端" : "移动端"}`);
+		out.push(`- 接口地址：${base}`);
+		out.push(`- 模型：${model}`);
+		out.push(
+			`- API Key：${key ? `已配置（${key.slice(0, 3)}…${key.slice(-2)}，共 ${key.length} 位）` : "未配置"}`,
+		);
+		out.push("");
+
+		if (!key) {
+			out.push("## 结论", "", "❌ 没有 API Key，没法测。去「设置 → 语音待办 → 云端转写 → 云端转写 API Key」填一个。");
+			await this.openReport("语音待办 连通测试", out.join("\n"));
+			return;
+		}
+
+		const t1 = Date.now();
+		try {
+			const resp = await this.withTimeout(
+				requestUrl({
+					url: `${base}/models`,
+					method: "GET",
+					headers: { Authorization: `Bearer ${key}` },
+					throw: false,
+				}),
+				15_000,
+				"拉取模型列表",
+			);
+			out.push("## 1. 鉴权与网络（GET /models）", "", `- 状态码：${resp.status}`, `- 耗时：${Date.now() - t1} ms`);
+			if (resp.status >= 400) {
+				out.push(`- 返回片段：${(resp.text || "").slice(0, 300)}`);
+				out.push("- 结论：❌ key 或接口地址不对");
+			} else {
+				out.push("- 结论：✅ 网络通、key 被接受");
+			}
+		} catch (err) {
+			out.push(
+				"## 1. 鉴权与网络（GET /models）",
+				"",
+				`- ❌ ${err instanceof Error ? err.message : String(err)}`,
+				`- 耗时：${Date.now() - t1} ms`,
+			);
+		}
+
+		const t2 = Date.now();
+		try {
+			const text = await this.withTimeout(
+				transcribeCloud({
+					baseUrl: base,
+					apiKey: key,
+					model,
+					audio: buildSilentWav(),
+					filename: "silence.wav",
+					mime: "audio/wav",
+					language: undefined,
+				}),
+				60_000,
+				"云端转写接口",
+			);
+			out.push("", "## 2. 转写接口（POST /audio/transcriptions）", "");
+			out.push(`- 耗时：${Date.now() - t2} ms`);
+			out.push(`- 返回文本：${text ? `「${text}」` : "（空，静音音频属正常）"}`);
+			out.push("- 结论：✅ 整条链路可用");
+			new Notice("云端转写连通：正常");
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			out.push("", "## 2. 转写接口（POST /audio/transcriptions）", "");
+			out.push(`- ❌ ${msg}`);
+			out.push(`- 耗时：${Date.now() - t2} ms`);
+			new Notice(`云端转写失败：${msg}`, 8000);
+			this.diag(`云端连通测试失败：${msg}`);
+		}
+
+		await this.openReport("语音待办 连通测试", out.join("\n"));
 	}
 
 	/** 把扫描目录里的未完成待办汇总到 Todo 笔记，按文本去重 */
@@ -533,15 +854,19 @@ export default class VoiceTodoPlugin extends Plugin {
 					: filename.endsWith(".ogg")
 						? "audio/ogg"
 						: "audio/webm";
-		return transcribeCloud({
-			baseUrl: this.settings.cloudBaseUrl,
-			apiKey: key,
-			model: this.settings.cloudModel,
-			audio,
-			filename,
-			mime,
-			language: this.settings.whisperLang === "auto" ? undefined : this.settings.whisperLang,
-		});
+		return this.withTimeout(
+			transcribeCloud({
+				baseUrl: this.settings.cloudBaseUrl,
+				apiKey: key,
+				model: this.settings.cloudModel,
+				audio,
+				filename,
+				mime,
+				language: this.settings.whisperLang === "auto" ? undefined : this.settings.whisperLang,
+			}),
+			120_000,
+			"云端转写",
+		);
 	}
 
 	/** 在「整理失败 / 转写失败」提示后面挂一个重试按钮 */
@@ -1031,6 +1356,22 @@ class VoiceTodoSettingTab extends PluginSettingTab {
 					this.plugin.settings.todoScanFolder = value.trim() || DEFAULT_SETTINGS.todoScanFolder;
 					await this.plugin.saveSettings();
 				}),
+			);
+
+		new Setting(containerEl).setName("诊断（手机端也能用）").setHeading();
+
+		new Setting(containerEl)
+			.setName("生成诊断报告")
+			.setDesc("把配置、目录状态、卡住的条目和最近错误写成一篇笔记放在仓库根目录。纯本地，不发网络请求。")
+			.addButton((btn) =>
+				btn.setButtonText("生成").onClick(() => void this.plugin.writeDiagnosticReport()),
+			);
+
+		new Setting(containerEl)
+			.setName("测试云端连通")
+			.setDesc("先拉一次模型列表验证 key，再用 0.4 秒静音音频真跑一次转写；共两个请求，不传你的录音。")
+			.addButton((btn) =>
+				btn.setButtonText("开始测试").onClick(() => void this.plugin.testCloudConnectivity()),
 			);
 	}
 }
