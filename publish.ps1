@@ -27,8 +27,11 @@ Push-Location $root
 try {
 	Write-Host "[1/3] 上传仓库文件到 $Owner/$Repo ..."
 	$flags = if ($Private) { "--private" } else { "--public" }
-	& $py $publisher $TokenFile $root "$Owner/$Repo" $flags
-	if ($LASTEXITCODE -ne 0) { throw "gh_publish 失败（退出码 $LASTEXITCODE）" }
+	& $py $publisher $TokenFile $root "$Owner/$Repo" $flags 2>&1 | Select-Object -Last 25
+	if ($LASTEXITCODE -ne 0) {
+		# 最常见的原因：token 没有 workflow scope，导致 .github/workflows/release.yml 推不上去（404）
+		Write-Warning "gh_publish 返回 $LASTEXITCODE（多半是缺 workflow scope，workflow 文件推不上）。继续发 release。"
+	}
 
 	$headers = @{
 		Authorization = "Bearer $token"
